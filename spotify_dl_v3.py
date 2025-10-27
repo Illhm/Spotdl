@@ -12,7 +12,6 @@ import sys
 import os
 import json
 import time
-import argparse
 from urllib.parse import urljoin, urlparse, parse_qs
 import requests
 
@@ -27,7 +26,7 @@ def _normalize_url(u: str) -> str:
         return u
     u = u.strip()
     # Unescape JSON-style escaped slashes
-    u = u.replace("\/", "/")
+    u = u.replace(r"\/", "/")
     # Handle protocol-relative URLs
     if u.startswith("//"):
         u = "https:" + u
@@ -226,51 +225,101 @@ def stream_download(session: requests.Session, url: str, out_path_base: str, ref
         sys.stdout.write(f"\nDone in {dur:0.2f}s → {out_path}\n")
         return out_path
 
+def _extract_track_id_from_path(path: str) -> str:
+    if not path:
+        return None
+    parts = [p for p in path.split("/") if p]
+    for idx, part in enumerate(parts):
+        if part == "track" and idx + 1 < len(parts):
+            candidate = parts[idx + 1]
+            candidate = re.split(r"[?#]", candidate)[0]
+            if re.fullmatch(r"[A-Za-z0-9]+", candidate):
+                return candidate
+    return None
+
+
+def resolve_track_url(raw_url: str, session: requests.Session):
+    if not raw_url:
+        raise ValueError("URL kosong.")
+
+    normalized = _normalize_url(raw_url)
+    headers = {"User-Agent": UA, "Referer": "https://open.spotify.com/"}
+    final_url = normalized
+
+    if "spotify.link" in normalized or "open.spotify.com" not in normalized:
+        try:
+            resp = session.get(normalized, allow_redirects=True, headers=headers, timeout=20)
+            resp.raise_for_status()
+            final_url = resp.url
+        except requests.RequestException as exc:
+            raise ValueError(f"Gagal mengikuti tautan: {exc}") from exc
+
+    parsed = urlparse(final_url)
+    track_id = _extract_track_id_from_path(parsed.path)
+    if not track_id:
+        raise ValueError("Tautan tidak mengarah ke track Spotify yang valid.")
+
+    canonical_display = f"https://open.spotify.com/intl-id/track/{track_id}"
+    canonical_api = f"https://open.spotify.com/track/{track_id}"
+    return canonical_display, canonical_api
+
+
+def ask_user_inputs(session: requests.Session):
+    print("=== Downloaderize Spotify Downloader ===")
+    from_cli = len(sys.argv) > 1
+    if from_cli:
+        raw_url = sys.argv[1].strip()
+    else:
+        raw_url = input("Masukkan URL track Spotify: ").strip()
+    try:
+        display_url, api_url = resolve_track_url(raw_url, session)
+    except ValueError as err:
+        print(f"ERROR: {err}", file=sys.stderr)
+        return None
+
+    if from_cli:
+        custom_output = None
+        forced_ext = None
+    else:
+        custom_output = input("Nama file output (opsional, tanpa ekstensi): ").strip()
+        forced_ext = input("Paksa ekstensi file (opsional, contoh mp3): ").strip()
+        if not forced_ext:
+            forced_ext = None
+
+    return {
+        "track_url_display": display_url,
+        "track_url_api": api_url,
+        "base": DEFAULT_BASE,
+        "output": custom_output or None,
+        "forced_ext": forced_ext,
+    }
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Downloaderize Spotify track downloader (unofficial).")
-    ap.add_argument("track_url", help="Spotify track URL, e.g. https://open.spotify.com/track/<id>")
-    ap.add_argument("-b", "--base", default=DEFAULT_BASE, help="Base site (default: %(default)s)")
-    ap.add_argument("--ajax-url", default=None, help="Override AJAX URL if discovery fails")
-    ap.add_argument("--nonce", default=None, help="Override nonce if discovery fails")
-    ap.add_argument("-o", "--output", default=None, help="Explicit output filename without extension (we'll infer)")
-    ap.add_argument("--ext", default=None, help="Force output extension, e.g. mp3")
-    ap.add_argument("--print-json", action="store_true", help="Print parsed JSON and exit (no download)")
-    ap.add_argument("--debug", action="store_true", help="Verbose debug output")
-    args = ap.parse_args()
-
-    if "open.spotify.com/track/" not in args.track_url:
-        print("ERROR: Please provide a valid Spotify track URL (https://open.spotify.com/track/...).", file=sys.stderr)
-        sys.exit(2)
-
     sess = requests.Session()
+    user_inputs = ask_user_inputs(sess)
+    if not user_inputs:
+        return
 
-    # Discovery (allow override)
-    ajax_url = _normalize_url(args.ajax_url) if args.ajax_url else None
-    nonce = args.nonce if args.nonce else None
+    track_url_display = user_inputs["track_url_display"]
+    track_url_api = user_inputs["track_url_api"]
+    base_url = user_inputs["base"]
+    out_choice = user_inputs["output"]
+    forced_ext = user_inputs["forced_ext"]
 
-    if not ajax_url or not nonce:
-        discovered_ajax, discovered_nonce = fetch_home_and_discover(sess, args.base)
-        if not ajax_url:
-            ajax_url = discovered_ajax
-        if not nonce:
-            nonce = discovered_nonce
+    ajax_url = None
+    nonce = None
+    discovered_ajax, discovered_nonce = fetch_home_and_discover(sess, base_url)
+    ajax_url = discovered_ajax
+    nonce = discovered_nonce
 
-    if args.debug:
-        debug(f"Fetching homepage to discover AJAX + nonce: {args.base}")
-        debug(f"AJAX URL: {ajax_url}")
-        debug(f"Nonce: {nonce or '(none)'}")
-
-    # Call API
-    code, data = call_info_api(sess, ajax_url, args.track_url, nonce, referer=args.base)
-    if args.debug:
-        debug(f"API HTTP {code}")
+    code, data = call_info_api(sess, ajax_url, track_url_api, nonce, referer=base_url)
 
     if not isinstance(data, dict):
         print("ERROR: Unexpected response type; not JSON object.", file=sys.stderr)
         print(str(data)[:800])
-        sys.exit(1)
+        return
 
-    # Some servers wrap in 'data' or 'result'
     payload = data
     for key in ("data", "result"):
         if isinstance(payload.get(key), dict) and any(k in payload[key] for k in ("medias", "title", "author", "artists")):
@@ -283,25 +332,24 @@ def main():
     if not media:
         print("ERROR: No downloadable media found in response.", file=sys.stderr)
         print(json.dumps(payload, indent=2, ensure_ascii=False)[:1200])
-        sys.exit(1)
+        return
 
     media_url = media.get("url")
-    # Use name/artist from URL query if available (fix mixed artist/title cases)
     title, artist = infer_tags_from_query(media_url, title, artist)
     thumb = payload.get("thumbnail") or payload.get("image")
+    print(f"Track URL final: {track_url_display}")
     print(f"Track: {title}\nArtist: {artist}")
     if thumb:
         print(f"Thumbnail: {thumb}")
 
-    # Determine output base name
-    if args.output:
-        out_base = args.output
+    if out_choice:
+        out_base = out_choice
     else:
         out_base = sanitize_filename(f"{artist} - {title}")
 
     out_base_abs = os.path.abspath(out_base)
     print(f"Downloading media: {media_url}")
-    final_path = stream_download(sess, media_url, out_base_abs, referer=args.base, forced_ext=args.ext)
+    stream_download(sess, media_url, out_base_abs, referer=base_url, forced_ext=forced_ext)
 
 if __name__ == "__main__":
     try:
