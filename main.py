@@ -3,9 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import requests
-import spotify_dl_v3 as sdl
 import uvicorn
 from typing import Optional
+import re
+import time
 
 app = FastAPI()
 
@@ -24,41 +25,119 @@ class TrackInfo(BaseModel):
     thumbnail: str | None
     media_url: str
 
+SPOTMATE_HOME = "https://spotmate.online/en1"
+SPOTMATE_ORIGIN = "https://spotmate.online"
+UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
+
+def fetch_csrf_token(session: requests.Session, home_url: str) -> str:
+    resp = session.get(
+        home_url,
+        headers={"User-Agent": UA, "Referer": home_url},
+        timeout=20
+    )
+    resp.raise_for_status()
+    match = re.search(r'name="csrf-token"\s+content="([^"]+)"', resp.text)
+    if not match:
+        raise ValueError("CSRF token not found on home page")
+    return match.group(1)
+
+def post_json(session: requests.Session, url: str, payload: dict, csrf_token: str, referer: str) -> dict:
+    headers = {
+        "Content-Type": "application/json",
+        "X-CSRF-TOKEN": csrf_token,
+        "User-Agent": UA,
+        "Referer": referer,
+        "Origin": SPOTMATE_ORIGIN,
+        "Accept": "*/*",
+    }
+    resp = session.post(url, json=payload, headers=headers, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+def poll_conversion_task(session: requests.Session, task_id: str, max_attempts: int = 40) -> dict:
+    task_url = f"{SPOTMATE_ORIGIN}/tasks/{task_id}"
+    headers = {"User-Agent": UA, "Referer": SPOTMATE_HOME}
+    for _ in range(max_attempts):
+        time.sleep(4.5)
+        resp = session.get(task_url, headers=headers, timeout=20)
+        if not resp.ok:
+            continue
+        try:
+            payload = resp.json()
+        except ValueError:
+            continue
+        return payload
+    return {}
+
+def parse_track_data(payload: dict) -> dict:
+    if payload.get("type") != "track":
+        raise HTTPException(status_code=400, detail="Only Spotify track URLs are supported")
+    title = payload.get("name") or "Unknown Title"
+    artists = payload.get("artists") or []
+    artist = artists[0].get("name") if isinstance(artists, list) and artists else "Unknown Artist"
+    images = (payload.get("album") or {}).get("images") or []
+    thumbnail = images[0].get("url") if isinstance(images, list) and images else None
+    return {"title": title, "artist": artist, "thumbnail": thumbnail}
+
+def extract_download_url(payload: dict) -> str | None:
+    if payload.get("error") is False and payload.get("url"):
+        return payload.get("url")
+    info = payload.get("data") or {}
+    if info.get("url"):
+        return info.get("url")
+    if isinstance(info.get("result"), dict) and info["result"].get("url"):
+        return info["result"].get("url")
+    return None
+
 def get_track_data_internal(url: str) -> dict:
     if "open.spotify.com/track/" not in url:
         raise HTTPException(status_code=400, detail="Invalid Spotify URL")
 
     session = requests.Session()
-    
-    # 1. Discovery
-    try:
-        ajax_url, nonce = sdl.fetch_home_and_discover(session, sdl.DEFAULT_BASE)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to discover API: {str(e)}")
 
-    # 2. Call API
     try:
-        code, data = sdl.call_info_api(session, ajax_url, url, nonce, referer=sdl.DEFAULT_BASE)
+        csrf_token = fetch_csrf_token(session, SPOTMATE_HOME)
     except Exception as e:
-         raise HTTPException(status_code=500, detail=f"Failed to call info API: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch CSRF token: {str(e)}")
 
-    if code != 200:
-        raise HTTPException(status_code=code, detail="Upstream API error")
-
-    # 3. Parse Response using helper from spotify_dl_v3
     try:
-        title, artist, media_url, thumbnail = sdl.extract_track_details(data)
+        track_payload = post_json(
+            session,
+            f"{SPOTMATE_ORIGIN}/getTrackData",
+            {"spotify_url": url},
+            csrf_token,
+            SPOTMATE_HOME,
+        )
     except Exception as e:
-         raise HTTPException(status_code=500, detail=f"Failed to parse response: {str(e)}")
-            
+        raise HTTPException(status_code=500, detail=f"Failed to fetch track info: {str(e)}")
+
+    track_data = parse_track_data(track_payload)
+
+    try:
+        convert_payload = post_json(
+            session,
+            f"{SPOTMATE_ORIGIN}/convert",
+            {"urls": url},
+            csrf_token,
+            SPOTMATE_HOME,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start conversion: {str(e)}")
+
+    media_url = extract_download_url(convert_payload)
+    task_id = convert_payload.get("task_id") or convert_payload.get("taskId")
+    if not media_url and task_id:
+        task_payload = poll_conversion_task(session, task_id)
+        media_url = extract_download_url(task_payload)
+
     if not media_url:
         raise HTTPException(status_code=404, detail="No media found for this track")
-        
+
     return {
-        "title": title,
-        "artist": artist,
-        "thumbnail": thumbnail,
-        "media_url": media_url
+        "title": track_data["title"],
+        "artist": track_data["artist"],
+        "thumbnail": track_data["thumbnail"],
+        "media_url": media_url,
     }
 
 def render_player(track: dict) -> str:
